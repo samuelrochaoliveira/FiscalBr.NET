@@ -1,6 +1,7 @@
 ﻿using FiscalBr.Common.Sped.Interfaces;
 using FiscalBr.Common.ValueObjects;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
@@ -21,7 +22,9 @@ namespace FiscalBr.Common.Sped
                 AoProcessarLinha.Invoke(sender, e);
         }
 
-        private readonly Dictionary<string, SpedCamposAttribute[]> CachedSpedCamposAttribute;
+        private readonly ConcurrentDictionary<PropertyInfo, SpedCamposAttribute[]> CachedSpedCamposAttribute;
+        private readonly ConcurrentDictionary<StructTipoVersao, List<PropertyInfo>> ObterListaComPropriedadesDoTipoCache;
+        private readonly ConcurrentDictionary<LeiauteArquivoSped?, int[]> ObterVersoesLeiauteCache;
 
         public SoftwareHouse SoftwareHouse { get; private set; }
         public LeiauteArquivoSped ArquivoSped { get; private set; }
@@ -39,7 +42,9 @@ namespace FiscalBr.Common.Sped
             Erros = new List<string>();
             Linhas = new List<string>();
 
-            CachedSpedCamposAttribute = new Dictionary<string, SpedCamposAttribute[]>();
+            CachedSpedCamposAttribute = new ConcurrentDictionary<PropertyInfo, SpedCamposAttribute[]>();
+            ObterListaComPropriedadesDoTipoCache = new ConcurrentDictionary<StructTipoVersao, List<PropertyInfo>>();
+            ObterVersoesLeiauteCache = new ConcurrentDictionary<LeiauteArquivoSped?, int[]>();
         }
 
         public ArquivoSpedV2(
@@ -92,7 +97,7 @@ namespace FiscalBr.Common.Sped
         {
             return Environment.NewLine;
         }
-
+        
         private bool IsCodeOrNumber(string v)
         {
             return v == Constantes.ArquivoDigital.Sped.TipoInformacao.CodeOrNumber;
@@ -213,37 +218,43 @@ namespace FiscalBr.Common.Sped
 
         #endregion Private Methods
 
-        public virtual string PreencherCampo(string valor, string tpAttr, string tpProp, int tamanho, int qtdCasas, bool ehObrigatorio)
+        public virtual string PreencherCampo(object valor, string tpAttr, string tpProp, int tamanho, int qtdCasas, bool ehObrigatorio)
         {
-            if (ehObrigatorio && !valor.HasValue())
+            if (ehObrigatorio && valor == null)
                 return Constantes.IsRequiredField;
 
-            // TODO: Refatorar e melhorar
-            if ((IsCodeOrNumber(tpAttr) && (tamanho > 0 && tamanho <= 4)) || IsLiteralEnum(tpAttr))
-                if (valor.Length <= tamanho)
-                    return FormatarCampoString(valor, tamanho, '0');
+            if(valor == null) {
+                return string.Empty;
+            }
+
+            if(IsLiteralEnum(tpAttr)) {
+                return valor.ToString();
+            }
 
             if (IsDateTime(tpProp))
                 if (IsHour(tpAttr))
-                    return FormatarCampoDateTime(Convert.ToDateTime(valor), "hhmmss");
+                    return FormatarCampoDateTime((DateTime)valor, "hhmmss");
                 else if (IsMonthAndYear(tpAttr))
-                    return FormatarCampoDateTime(Convert.ToDateTime(valor), "MMyyyy");
+                    return FormatarCampoDateTime((DateTime)valor, "MMyyyy");
                 else
-                    return FormatarCampoDateTime(Convert.ToDateTime(valor), "ddMMyyyy");
+                    return FormatarCampoDateTime((DateTime)valor, "ddMMyyyy");
 
-            if (IsDecimal(tpProp))
-            {
-                if (ehObrigatorio)
-                    if (!valor.HasValue())
-                        return FormatarCampoDecimal(Constantes.VZero, qtdCasas);
-
-                return FormatarCampoDecimal(Convert.ToDecimal(valor), qtdCasas);
+            if (IsDecimal(tpProp)) {
+                return FormatarCampoDecimal((decimal)valor, qtdCasas);
             }
 
-            if (valor.Length > tamanho)
-                return FormatarCampoString(valor.Substring(0, tamanho));
+            if ((IsCodeOrNumber(tpAttr) && (tamanho > 0 && tamanho <= 4))) {
+                var vStrCode = valor.ToString();
+                if (vStrCode.Length <= tamanho)
+                    return FormatarCampoString(vStrCode, tamanho, '0');
+            }
 
-            return FormatarCampoString(valor);
+            // TODO: Refatorar e melhorar
+            var valorStr = valor.ToStringSafe().Trim();
+            if (valorStr.Length > tamanho)
+                return FormatarCampoString(valorStr.Substring(0, tamanho));
+
+            return FormatarCampoString(valorStr);
         }
 
         public bool ExisteAtributoSpedNaPropriedade(PropertyInfo prop, int versao)
@@ -251,16 +262,8 @@ namespace FiscalBr.Common.Sped
             return ObterAtributosSpedDoCache(prop).Any(a => a.Versao == versao);
         }
 
-        private SpedCamposAttribute[] ObterAtributosSpedDoCache(PropertyInfo prop)
-        {
-            lock (CachedSpedCamposAttribute)
-            {
-                string propName = $"{prop.DeclaringType.FullName}.{prop.Name}";
-                if (!CachedSpedCamposAttribute.ContainsKey(propName))
-                    CachedSpedCamposAttribute.Add(propName, (SpedCamposAttribute[])Attribute.GetCustomAttributes(prop, typeof(SpedCamposAttribute)));
-
-                return CachedSpedCamposAttribute[propName];
-            }
+        private SpedCamposAttribute[] ObterAtributosSpedDoCache(PropertyInfo prop) {
+            return CachedSpedCamposAttribute.GetOrAdd(prop, _ => (SpedCamposAttribute[])Attribute.GetCustomAttributes(prop, typeof(SpedCamposAttribute)));
         }
 
         public SpedCamposAttribute ObterAtributoSpedDaPropriedade(PropertyInfo prop, int? versao = null)
@@ -303,7 +306,15 @@ namespace FiscalBr.Common.Sped
 
             return false;
         }
-
+        
+        private struct StructTipoVersao {
+            public Type Type { get; set; }
+            public int? Versao { get; set; }
+            public StructTipoVersao(Type prop, int? versao) {
+                Type = prop;
+                Versao = versao;
+            }
+        }
         public List<PropertyInfo> ObterListaComPropriedadesDoTipo(Type t, int? v)
         {
             /*
@@ -315,23 +326,25 @@ namespace FiscalBr.Common.Sped
             //    .FirstOrDefault())
             //    .ToList();
 
-            var r = t.GetProperties()
-                .Where(p => Attribute.IsDefined(p, typeof(SpedCamposAttribute))); //Só quero os campos do tipo SpedCamposAttribute, ignorando registros filhos!
+            return ObterListaComPropriedadesDoTipoCache.GetOrAdd(new StructTipoVersao(t,v), (s) => {
+                var r = s.Type.GetProperties()
+                    .Where(p => Attribute.IsDefined(p, typeof(SpedCamposAttribute))); //Só quero os campos do tipo SpedCamposAttribute, ignorando registros filhos!
 
-            if (v != null)
-                if (v.HasValue && v > 0)
-                {
-                    r = r.Where(x => x.GetCustomAttributes(typeof(SpedCamposAttribute), true)
+                if (s.Versao != null)
+                    if (s.Versao.HasValue && s.Versao > 0) {
+                        r = r.Where(x => x.GetCustomAttributes(typeof(SpedCamposAttribute), true)
+                        .Cast<SpedCamposAttribute>()
+                        .Any(a => a.Versao <= s.Versao));
+                    }
+
+                r = r.OrderBy(p => p.GetCustomAttributes(typeof(SpedCamposAttribute), true)
                     .Cast<SpedCamposAttribute>()
-                    .Any(a => a.Versao <= v));
-                }
+                    .Select(a => a.Ordem)
+                    .FirstOrDefault());
 
-            r = r.OrderBy(p => p.GetCustomAttributes(typeof(SpedCamposAttribute), true)
-                .Cast<SpedCamposAttribute>()
-                .Select(a => a.Ordem)
-                .FirstOrDefault());
-
-            return r.ToList();
+                return r.ToList();
+            });
+            
         }
 
         public virtual string ObterTipoDaPropriedade(PropertyInfo prop)
@@ -348,7 +361,8 @@ namespace FiscalBr.Common.Sped
             if (prop.PropertyType == typeof(DateTime?))
                 return Constantes.ArquivoDigital.Sped.TipoInformacao.NullableDateTime;
 
-            if (prop.PropertyType == typeof(Int16) ||
+            if (prop.PropertyType.IsEnum ||
+                prop.PropertyType == typeof(Int16) ||
                 prop.PropertyType == typeof(Int16?) ||
                 prop.PropertyType == typeof(Int32) ||
                 prop.PropertyType == typeof(Int32?))
@@ -421,15 +435,16 @@ namespace FiscalBr.Common.Sped
                             spedCampoAttr = ObterAtributoSpedDaPropriedade(property);
                             break;
                         default:
-                            while (!ExisteAtributoSpedNaPropriedade(property, versaoDesejada))
+                            var maiorVersaoEncontrada = 0;
+                            for (var i = attrs.Length - 1; i >= 0; i--)
                             {
-                                versaoDesejada--;
-
-                                if (versaoDesejada < 1)
-                                    break;
+                                if (attrs[i].Versao <= versaoDesejada && attrs[i].Versao > maiorVersaoEncontrada)
+                                {
+                                    spedCampoAttr = attrs[i];
+                                    maiorVersaoEncontrada = attrs[i].Versao;
+                                }
                             }
 
-                            spedCampoAttr = ObterAtributoSpedDaPropriedade(property, versaoDesejada);
                             break;
                     }
 
@@ -437,11 +452,10 @@ namespace FiscalBr.Common.Sped
                         Erros.Add(string.Format(
                             "O campo {0} no registro {1} não possui atributo SPED definido!", property.Name, reg.Reg));
 
-                    var propertyValue = RegistroSped.GetPropValue(reg, property.Name);
-                    var propertyValueToStringSafe = propertyValue.ToStringSafe().Trim();
+                    var propertyValue = RegistroSped.GetPropValue(reg, property);
 
                     var campoEscrito = PreencherCampo(
-                        propertyValueToStringSafe,
+                        propertyValue,
                         ObterTipoDoAtributo(spedCampoAttr),
                         ObterTipoDaPropriedade(property),
                         spedCampoAttr.Tamanho,
@@ -639,18 +653,19 @@ namespace FiscalBr.Common.Sped
 
         public virtual int[] ObterVersoesLeiaute(LeiauteArquivoSped? leiauteSped)
         {
-            switch (leiauteSped ?? ArquivoSped)
-            {
-                case LeiauteArquivoSped.ECD:
-                    return EnumHelpers.GetEnumValues<CodVersaoSpedECD>();
-                case LeiauteArquivoSped.ECF:
-                    return EnumHelpers.GetEnumValues<CodVersaoSpedECF>();
-                case LeiauteArquivoSped.EFDContrib:
-                    return EnumHelpers.GetEnumValues<CodVersaoSpedContrib>();
-                case LeiauteArquivoSped.EFDFiscal:
-                    return EnumHelpers.GetEnumValues<CodVersaoSpedFiscal>();
-            }
-            throw new ArgumentException("O leiute do arquivo não foi especificado!");
+            return ObterVersoesLeiauteCache.GetOrAdd(leiauteSped ?? ArquivoSped, (leiaute) => {
+                switch (leiaute) {
+                    case LeiauteArquivoSped.ECD:
+                        return EnumHelpers.GetEnumValues<CodVersaoSpedECD>();
+                    case LeiauteArquivoSped.ECF:
+                        return EnumHelpers.GetEnumValues<CodVersaoSpedECF>();
+                    case LeiauteArquivoSped.EFDContrib:
+                        return EnumHelpers.GetEnumValues<CodVersaoSpedContrib>();
+                    case LeiauteArquivoSped.EFDFiscal:
+                        return EnumHelpers.GetEnumValues<CodVersaoSpedFiscal>();
+                }
+                throw new ArgumentException("O leiute do arquivo não foi especificado!");
+            });
         }
 
         public virtual Enum ObterEnumVersaoLeiaute()
